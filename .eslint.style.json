@@ -1,0 +1,29 @@
+{
+    "rules": {
+        "max-len": [
+            "error",
+            {
+                "code": 200
+            }
+        ],
+        "indent": ["error", 4, { "SwitchCase": 1 }],
+        "quotes": ["error", "double"],
+        "semi": ["error", "always"],
+        "brace-style": ["error", "stroustrup"],
+        "curly": ["error", "all"],
+        "object-curly-spacing": ["error", "always"],
+        "no-mixed-spaces-and-tabs": "error",
+        "arrow-spacing": ["error"],
+        "comma-dangle": ["error", "never"],
+        "comma-style": ["error"],
+        "no-extra-semi": "error",
+        "comma-spacing": "error",
+        "space-in-parens": ["error", "never"],
+        "space-before-blocks": "error",
+        "space-before-function-paren": ["error", { "anonymous": "never", "named": "never", "asyncArrow": "always" }],
+        "keyword-spacing": "error",
+        "no-multi-spaces": "error",
+        "space-infix-ops": "error",
+        "one-var": ["error", "never"]
+    }
+}

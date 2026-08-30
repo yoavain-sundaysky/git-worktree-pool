@@ -1,0 +1,14 @@
+/node_modules/
+/dist/
+/coverage/
+/.eslintcache/
+*.tsbuildinfo
+junit.xml
+*.tgz
+*.log
+.env
+/.idea/
+*.iml
+/.vscode/
+/.claude/settings.local.json
+/docs/plan/

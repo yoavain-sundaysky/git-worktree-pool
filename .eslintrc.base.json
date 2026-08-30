@@ -1,0 +1,47 @@
+{
+    "plugins": ["node", "import", "jest"],
+    "extends": ["eslint:recommended", "plugin:import/errors", "plugin:import/warnings", "plugin:node/recommended","plugin:import/typescript", "./.eslint.style.json"],
+    "settings": {
+        "node": {
+            "resolvePaths": ["node_modules/@types"],
+            "tryExtensions": [".ts", ".js", ".d.ts", ".json"]
+        }
+    },
+    "overrides": [
+        {
+            "files": ["unit_test/**", "stress_test/**", "integration_test/**", "scripts/**"],
+            "rules": {
+                "no-console": 0
+            }
+        }
+    ],
+    "rules": {
+        "no-console": "error",
+        "no-unused-vars": 0,
+        "no-useless-escape": 0,
+        "no-empty-pattern": 0,
+        "no-eval": "error",
+        "no-implied-eval": "error",
+        "no-prototype-builtins": "warn",
+        "node/no-sync": "error",
+        "node/exports-style": ["error", "module.exports"],
+        "node/no-unpublished-require": 0,
+        "node/no-extraneous-import": 0,
+        "node/no-deprecated-api": ["warn"],
+        "node/no-missing-require": "error",
+        "node/no-missing-import": "error",
+        "node/no-unpublished-import": 0,
+        "node/no-unsupported-features/es-syntax": 0,
+        "import/extensions": [
+            "error",
+            {
+                "ts": "never",
+                "js": "never",
+                "json": "always"
+            }
+        ],
+        "import/named": "warn",
+        "import/no-duplicates": "error",
+        "import/no-unresolved": ["warn"]
+    }
+}

@@ -1,0 +1,16 @@
+{
+  "extends": "@tsconfig/node22",
+  "compilerOptions": {
+    "target": "es6",
+    "strict": false,
+    "allowJs": true,
+    "rootDir": ".",
+    "declaration": true,
+    "verbatimModuleSyntax": false,
+    "sourceMap": true,
+    "noEmit": true,
+    "isolatedModules": true
+  },
+  "include": ["src/**/*", "test/**/*", "scripts/**/*", "*.ts"],
+  "exclude": ["node_modules"]
+}

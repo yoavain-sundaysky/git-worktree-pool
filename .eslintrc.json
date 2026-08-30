@@ -1,0 +1,38 @@
+{
+  "env": {
+    "es6": true,
+    "node": true,
+    "jest": true,
+    "jasmine": true
+  },
+  "globals": {
+    "NodeJS": "readonly"
+  },
+  "extends": ["./.eslintrc.base.json", "./.eslintrc.typescript.json"],
+  "parser": "@typescript-eslint/parser",
+  "parserOptions": {
+    "sourceType": "module",
+    "ecmaFeatures": {
+      "modules": true
+    },
+    "project": "./tsconfig.json",
+    "ecmaVersion": 6
+  },
+  "rules": {
+    "import/no-unresolved": 0,
+    "node/no-missing-require": ["error", {
+      "tryExtensions": [".ts", ".js", ".json"]
+    }],
+    "@typescript-eslint/consistent-type-imports": ["error", { "prefer": "type-imports" }],
+    "import/no-default-export": "warn"
+  },
+  "overrides": [
+    {
+      "files": [ "test/**" ],
+      "rules": {
+        "no-console": 0,
+        "import/no-default-export": 0
+      }
+    }
+  ]
+}
