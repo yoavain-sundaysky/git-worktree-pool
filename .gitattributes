@@ -1,0 +1,3 @@
+shell/gwt.sh  text eol=lf
+shell/gwt.ps1 text eol=lf
+shell/gwt.cmd text eol=crlf

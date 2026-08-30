@@ -1,8 +1,9 @@
 /* eslint-disable no-console,no-process-exit,node/no-sync */
 import { parseArgs } from "node:util";
-import { execSync } from "node:child_process";
+import { execFileSync, execSync } from "node:child_process";
 import * as path from "node:path";
 import * as fs from "node:fs";
+import * as os from "node:os";
 import { createInterface } from "node:readline/promises";
 import { stdin as input, stdout as output } from "node:process";
 import clipboardy from "clipboardy";
@@ -77,6 +78,64 @@ const confirm = async (message: string): Promise<boolean> => {
     finally {
         rl.close();
     }
+};
+
+type Prompter = {
+    ask: (message: string, defaultValue: string) => Promise<string>;
+    yesNo: (message: string, defaultYes: boolean) => Promise<boolean>;
+    close: () => void;
+};
+
+// One readline interface for a whole interactive session. A line that answers a pending question goes to that
+// question and is never emitted as "line", so every "line" event seen here is one that arrived between two
+// questions (piped stdin delivers everything at once); those are buffered instead of dropped. An empty answer
+// takes the default; EOF aborts instead of hanging.
+const createPrompter = (): Prompter => {
+    const rl = createInterface({ input, output });
+    const INPUT_CLOSED = "Input closed before the question was answered.";
+    const buffered: string[] = [];
+    let closed = false;
+    rl.on("line", line => {
+        buffered.push(line);
+    });
+    rl.on("close", () => {
+        closed = true;
+    });
+
+    const nextAnswer = async (promptText: string): Promise<string> => {
+        if (buffered.length > 0) {
+            const answer = buffered.shift() as string;
+            output.write(`${promptText}${answer}\n`);
+            return answer;
+        }
+        if (closed) {
+            throw new Error(INPUT_CLOSED);
+        }
+        let onClose: () => void = () => {};
+        const closedWhileWaiting = new Promise<never>((_, reject) => {
+            onClose = () => reject(new Error(INPUT_CLOSED));
+            rl.once("close", onClose);
+        });
+        try {
+            return await Promise.race([rl.question(promptText), closedWhileWaiting]);
+        }
+        finally {
+            rl.off("close", onClose);
+        }
+    };
+
+    const ask = async (message: string, defaultValue: string): Promise<string> => {
+        const answer = (await nextAnswer(`${message} [${defaultValue}] `)).trim();
+        return answer || defaultValue;
+    };
+    const yesNo = async (message: string, defaultYes: boolean): Promise<boolean> => {
+        const answer = (await ask(message, defaultYes ? "Y/n" : "y/N")).toLowerCase();
+        if (answer === "y/n") {
+            return defaultYes;
+        }
+        return answer === "y" || answer === "yes";
+    };
+    return { ask, yesNo, close: () => rl.close() };
 };
 
 const choose = async (message: string, choices: string[]): Promise<string | undefined> => {
@@ -379,7 +438,7 @@ const chooseDirtyPlan = async (slotPath: string): Promise<DirtyPlan> => {
     return choice as DirtyPlan;
 };
 
-// --- Clipboard + post-assign hooks -------------------------------------
+// --- Clipboard, cwd file + post-assign hooks ---------------------------
 
 const copyToClipboard = (text: string): void => {
     try {
@@ -387,6 +446,20 @@ const copyToClipboard = (text: string): void => {
     }
     catch {
         console.error("WARNING: Could not copy to clipboard.");
+    }
+};
+
+// A child process cannot change its parent's cwd, so the bundled "gwt" wrappers (shell/) read the
+// target path from this file and run the cd themselves.
+const writeCwdFile = (cwdFile: string | undefined, targetPath: string): void => {
+    if (!cwdFile) {
+        return;
+    }
+    try {
+        fs.writeFileSync(cwdFile, `${targetPath}\n`, "utf8");
+    }
+    catch {
+        console.error(`WARNING: Could not write the cwd file: ${cwdFile}`);
     }
 };
 
@@ -501,7 +574,7 @@ export const pickFreeSlot = (freeSlots: string[]): FreeSlotPick => {
     return { blocked };
 };
 
-export const cmdAssign = async (repoRoot: string, poolDir: string, repoName: string, branch: string, noSetup: boolean, yes: boolean): Promise<void> => {
+export const cmdAssign = async (repoRoot: string, poolDir: string, repoName: string, branch: string, noSetup: boolean, yes: boolean, cwdFile?: string): Promise<void> => {
     if (!branch) {
         console.error("ERROR: Usage: git-wt-pool assign <branch>");
         process.exit(1);
@@ -617,6 +690,7 @@ export const cmdAssign = async (repoRoot: string, poolDir: string, repoName: str
     console.log(`  Assigned: ${assignedSlot} <-- ${branch}`);
     copyToClipboard(assignedSlot);
     console.error("Path copied to clipboard.");
+    writeCwdFile(cwdFile, assignedSlot);
 
     if (!noSetup) {
         runPostAssignHooks(repoRoot, assignedSlot, branch);
@@ -772,7 +846,7 @@ export const cmdRemove = async (repoRoot: string, poolDir: string, repoName: str
     console.log(`Removed: ${slotPath}`);
 };
 
-const cmdPath = (repoRoot: string, poolDir: string, repoName: string, arg: string): void => {
+export const cmdPath = (repoRoot: string, poolDir: string, repoName: string, arg: string, cwdFile?: string): void => {
     const targetPath = (!arg || arg === "root") ? repoRoot : resolveSlot(poolDir, repoName, arg);
 
     if (!fs.existsSync(targetPath)) {
@@ -783,6 +857,317 @@ const cmdPath = (repoRoot: string, poolDir: string, repoName: string, arg: strin
     console.log(targetPath);
     copyToClipboard(targetPath);
     console.error("Path copied to clipboard.");
+    writeCwdFile(cwdFile, targetPath);
+};
+
+// --- Shell integration ("gwt") -----------------------------------------
+
+export const WRAPPER_ENV = "GIT_WT_POOL_WRAPPER";
+
+// Resolves to <package root>/shell both from dist/bin at runtime and from src/bin under ts-jest.
+const SHELL_DIR = path.join(__dirname, "..", "..", "shell");
+
+// The wrappers set GIT_WT_POOL_WRAPPER=1 for the child process. At an interactive prompt git-wt-pool insists
+// on running through them, because only the wrapper can cd the user's shell. Scripts, CI and hooks have no
+// prompt to cd, so a non-TTY stdin passes through.
+export const needsWrapperSetup = (command: string | undefined, env: NodeJS.ProcessEnv, interactive: boolean): boolean =>
+    interactive && env[WRAPPER_ENV] !== "1" && (command ?? "").toLowerCase() !== "init";
+
+export const SHELL_KINDS = ["bash", "zsh", "powershell", "cmd"] as const;
+export type ShellKind = typeof SHELL_KINDS[number];
+
+const SHELL_LABELS: Record<ShellKind, string> = { bash: "bash", zsh: "zsh", powershell: "PowerShell", cmd: "cmd.exe" };
+
+export const parseShellKind = (name: string): ShellKind | undefined => {
+    const lower = name.toLowerCase();
+    if (lower === "pwsh") {
+        return "powershell";
+    }
+    if (lower === "sh") {
+        return "bash";
+    }
+    return SHELL_KINDS.find(kind => kind === lower);
+};
+
+// "-zsh" is a macOS login shell; "sh.exe" is Git Bash seen through npm's sh shim, whose exec cannot replace the process on Windows.
+const normalizeProcessName = (name: string): string =>
+    path.basename(name.trim()).replace(/^-/, "").replace(/\.exe$/i, "").toLowerCase();
+
+// Only "init" pays for this: about 300 ms for tasklist on Windows, negligible elsewhere.
+const parentProcessName = (): string | undefined => {
+    try {
+        if (process.platform === "win32") {
+            const csv = execFileSync("tasklist", ["/FI", `PID eq ${process.ppid}`, "/FO", "CSV", "/NH"], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
+            return csv.startsWith("\"") ? csv.split(",")[0].replace(/"/g, "") : undefined;
+        }
+        if (process.platform === "linux") {
+            return fs.readFileSync(`/proc/${process.ppid}/comm`, "utf8").trim() || undefined;
+        }
+        return execFileSync("ps", ["-o", "comm=", "-p", String(process.ppid)], { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim() || undefined;
+    }
+    catch {
+        return undefined;
+    }
+};
+
+export type ShellEvidence = { platform: NodeJS.Platform; env: NodeJS.ProcessEnv; parentProcess?: string };
+
+// The parent process wins because environment markers are inherited: a cmd window opened from PowerShell, or an editor
+// started from Git Bash, carries the parent's markers. The env fallback covers npx (the parent is node) and a failed lookup.
+export const detectShell = ({ platform, env, parentProcess }: ShellEvidence): ShellKind => {
+    const parent = parentProcess ? normalizeProcessName(parentProcess) : "";
+    if (parent === "zsh") {
+        return "zsh";
+    }
+    if (parent === "bash" || parent === "sh") {
+        return "bash";
+    }
+    if (parent === "pwsh" || parent === "powershell") {
+        return "powershell";
+    }
+    if (parent === "cmd") {
+        return "cmd";
+    }
+
+    const loginShell = path.basename(env.SHELL ?? "");
+    if (platform === "win32") {
+        if (env.MSYSTEM || env.SHELL) {
+            return loginShell.startsWith("zsh") ? "zsh" : "bash";
+        }
+        // pwsh and Windows PowerShell prepend the user's Documents\...\Modules for their children; cmd.exe does not.
+        const userModules = (env.PSModulePath ?? "").split(";").some(entry => env.USERPROFILE !== undefined && entry.startsWith(env.USERPROFILE));
+        return userModules ? "powershell" : "cmd";
+    }
+    if (env.PSModulePath) {
+        return "powershell";
+    }
+    return loginShell.startsWith("zsh") ? "zsh" : "bash";
+};
+
+const detectCurrentShell = (): ShellKind =>
+    detectShell({ platform: process.platform, env: process.env, parentProcess: parentProcessName() });
+
+const formatSetupBlock = (label: string, what: string, how: string): string =>
+    ` ${label.padEnd(13)} ${what}\n               ${how}\n`;
+
+const setupBlock = (shellDir: string, kind: ShellKind | "bash / zsh"): string => {
+    const sourceLine = `source "${path.join(shellDir, "gwt.sh")}"`;
+    switch (kind) {
+        case "bash":
+            return formatSetupBlock("bash", "add this line to ~/.bashrc:", sourceLine);
+        case "zsh":
+            return formatSetupBlock("zsh", "add this line to ~/.zshrc:", sourceLine);
+        case "bash / zsh":
+            return formatSetupBlock("bash / zsh", "add this line to ~/.bashrc or ~/.zshrc:", sourceLine);
+        case "powershell":
+            return formatSetupBlock("PowerShell", "copy the file into a directory on your PATH:", `Copy-Item "${path.join(shellDir, "gwt.ps1")}" <directory-on-PATH>`);
+        case "cmd":
+            return formatSetupBlock("cmd.exe", "copy the file into a directory on your PATH:", `copy "${path.join(shellDir, "gwt.cmd")}" <directory-on-PATH>`);
+        default:
+            return "";
+    }
+};
+
+export type SetupOptions = { detected?: ShellKind; platform?: NodeJS.Platform };
+
+export const renderShellSetup = (shellDir: string, { detected, platform = process.platform }: SetupOptions = {}): string => {
+    const blocks = detected
+        ? [
+            ` Your shell looks like ${SHELL_LABELS[detected]}.`,
+            "",
+            setupBlock(shellDir, detected),
+            " Other shells: git-wt-pool init --print bash | zsh | powershell | cmd, or git-wt-pool init --print --all",
+            ""
+        ]
+        : [
+            setupBlock(shellDir, "bash / zsh"),
+            setupBlock(shellDir, "powershell"),
+            ...(platform === "win32" ? [setupBlock(shellDir, "cmd")] : [])
+        ];
+    return [
+        "",
+        " gwt - runs git-wt-pool and changes directory after \"assign\" and \"path\".",
+        " A child process cannot cd for its parent shell, so a small wrapper runs inside your shell.",
+        " \"git-wt-pool init\" installs it for you. To do it by hand, the files ship with this package:",
+        "",
+        ...blocks,
+        " Then use:  gwt assign <branch>   gwt path root   gwt path 2   gwt list   gwt free 2",
+        " Scripts and CI can call git-wt-pool directly; the wrapper is required only at an interactive prompt.",
+        ""
+    ].join("\n");
+};
+
+const printWrapperRequired = (): void => {
+    console.error("ERROR: At a prompt, git-wt-pool is used through its \"gwt\" wrapper, which changes directory for you.");
+    console.error("       Run \"git-wt-pool init\" once to install it. Scripts and CI can call git-wt-pool directly.");
+};
+
+// --- init: install the wrapper -----------------------------------------
+
+export type InitContext = {
+    shellDir: string;
+    platform: NodeJS.Platform;
+    env: NodeJS.ProcessEnv;
+    homeDir: string;
+    interactive: boolean;
+    detected: ShellKind;
+};
+
+const expandHome = (candidate: string, homeDir: string): string =>
+    path.resolve(candidate.replace(/^~(?=$|[\\/])/, homeDir));
+
+const normalizeDir = (dir: string, platform: NodeJS.Platform): string => {
+    const resolved = path.resolve(dir).replace(/[\\/]+$/, "");
+    return platform === "win32" ? resolved.toLowerCase() : resolved;
+};
+
+const pathEntries = (env: NodeJS.ProcessEnv): string[] =>
+    (env.PATH ?? env.Path ?? "").split(path.delimiter).filter(entry => entry.length > 0);
+
+const isOnPath = (dir: string, { env, platform }: InitContext): boolean =>
+    pathEntries(env).some(entry => normalizeDir(entry, platform) === normalizeDir(dir, platform));
+
+// npm installs a global package at <prefix>/node_modules/<pkg> on Windows and <prefix>/lib/node_modules/<pkg> elsewhere;
+// the bin directory npm already put on PATH is <prefix> and <prefix>/bin respectively.
+const npmGlobalBinDir = ({ shellDir, platform }: InitContext): string =>
+    platform === "win32" ? path.resolve(shellDir, "..", "..", "..") : path.resolve(shellDir, "..", "..", "..", "..", "bin");
+
+// npm's global bin dir is offered when it is on PATH; otherwise the user pastes a directory. PATH is not listed:
+// it commonly holds dozens of entries, and the user knows which one is theirs.
+const chooseInstallDir = async (file: string, ctx: InitContext, prompt: Prompter): Promise<string | undefined> => {
+    const npmDir = npmGlobalBinDir(ctx);
+    if (isOnPath(npmDir, ctx) && await prompt.yesNo(` Copy ${file} to ${npmDir} (on your PATH)?`, true)) {
+        return npmDir;
+    }
+
+    const answer = await prompt.ask(` Copy ${file} to which directory? It must be on your PATH.`, "");
+    if (!answer) {
+        console.error("ERROR: No directory given. Nothing was installed.");
+        process.exit(1);
+    }
+    const chosen = expandHome(answer, ctx.homeDir);
+    if (!isOnPath(chosen, ctx)) {
+        console.error(`WARNING: ${chosen} is not on your PATH, so "gwt" will not be found until it is.`);
+        if (!await prompt.yesNo(" Copy there anyway?", false)) {
+            console.log("Aborted. Nothing was installed.");
+            return undefined;
+        }
+    }
+    return chosen;
+};
+
+// PowerShell scripts and batch files run inside the calling session, so a copy on PATH is a complete install.
+const installPathWrapper = async (kind: "powershell" | "cmd", ctx: InitContext, prompt: Prompter): Promise<void> => {
+    const file = kind === "powershell" ? "gwt.ps1" : "gwt.cmd";
+    const dir = await chooseInstallDir(file, ctx, prompt);
+    if (!dir) {
+        return;
+    }
+    const destination = path.join(dir, file);
+    try {
+        fs.mkdirSync(dir, { recursive: true });
+        fs.copyFileSync(path.join(ctx.shellDir, file), destination);
+    }
+    catch (e) {
+        console.error(`ERROR: Could not copy to ${destination}: ${(e as Error).message}`);
+        process.exit(1);
+    }
+    console.log(` Installed ${destination}.`);
+    console.log(" Ready in this shell: gwt assign <branch>   gwt path root   gwt list");
+};
+
+export const POSIX_WRAPPER_HOME_PATH = ".config/git-wt-pool/gwt.sh";
+const POSIX_SOURCE_LINE = `source "$HOME/${POSIX_WRAPPER_HOME_PATH}"`;
+
+// A file on PATH runs as a child process and cannot cd, so bash/zsh get a copy in $HOME plus a source line in the
+// profile. The copy, not the install directory, is sourced: it survives a Node version switch under nvm.
+const installPosixWrapper = async (kind: "bash" | "zsh", ctx: InitContext, prompt: Prompter): Promise<void> => {
+    const destination = path.join(ctx.homeDir, ...POSIX_WRAPPER_HOME_PATH.split("/"));
+    const profileAnswer = await prompt.ask(" Add the source line to which profile file?", `~/.${kind}rc`);
+    const profile = expandHome(profileAnswer, ctx.homeDir);
+
+    console.log();
+    console.log(" This will:");
+    console.log(`   copy    ${path.join(ctx.shellDir, "gwt.sh")}`);
+    console.log(`       to  ${destination}`);
+    console.log(`   append  ${POSIX_SOURCE_LINE}`);
+    console.log(`       to  ${profile}`);
+    if (!await prompt.yesNo(" Proceed?", true)) {
+        console.log("Aborted. Nothing was installed.");
+        return;
+    }
+
+    try {
+        fs.mkdirSync(path.dirname(destination), { recursive: true });
+        fs.copyFileSync(path.join(ctx.shellDir, "gwt.sh"), destination);
+        const existing = fs.existsSync(profile) ? fs.readFileSync(profile, "utf8") : "";
+        if (existing.includes(POSIX_WRAPPER_HOME_PATH)) {
+            console.log(` ${profile} already sources the wrapper - left unchanged.`);
+        }
+        else {
+            const separator = existing.length > 0 && !existing.endsWith("\n") ? "\n" : "";
+            fs.appendFileSync(profile, `${separator}\n# git-wt-pool: the gwt wrapper, added by "git-wt-pool init"\n${POSIX_SOURCE_LINE}\n`, "utf8");
+            console.log(` Added the source line to ${profile}.`);
+        }
+    }
+    catch (e) {
+        console.error(`ERROR: Could not install: ${(e as Error).message}`);
+        process.exit(1);
+    }
+    console.log(` Installed ${destination}.`);
+    console.log(` New shells load it from ${profileAnswer}. For this shell, run:  ${POSIX_SOURCE_LINE}`);
+    console.log(" Then use: gwt assign <branch>   gwt path root   gwt list");
+};
+
+export type InitOptions = { print: boolean; all: boolean };
+
+export const cmdInit = async (requested: string | undefined, { print, all }: InitOptions, ctx: InitContext): Promise<void> => {
+    const requestedKind = requested ? parseShellKind(requested) : undefined;
+    if (requested && !requestedKind) {
+        console.error(`ERROR: Unknown shell "${requested}". Use one of: ${SHELL_KINDS.join(", ")}.`);
+        process.exit(1);
+    }
+    const target = requestedKind ?? ctx.detected;
+
+    if (print || !ctx.interactive) {
+        if (!print) {
+            console.error("Not an interactive terminal - printing the manual setup instead.");
+        }
+        console.log(renderShellSetup(ctx.shellDir, all ? { platform: ctx.platform } : { detected: target, platform: ctx.platform }));
+        return;
+    }
+
+    console.log();
+    console.log(" gwt - runs git-wt-pool and changes directory after \"assign\" and \"path\".");
+    if (requestedKind) {
+        console.log(` Installing the wrapper for ${SHELL_LABELS[requestedKind]}.`);
+    }
+    else {
+        console.log(` Your shell looks like ${SHELL_LABELS[target]}.`);
+    }
+
+    const prompt = createPrompter();
+    try {
+        const kind = requestedKind ?? parseShellKind(await prompt.ask(` Install the wrapper for which shell? (${SHELL_KINDS.join(", ")})`, target));
+        if (!kind) {
+            console.error(`ERROR: Unknown shell. Use one of: ${SHELL_KINDS.join(", ")}.`);
+            process.exit(1);
+        }
+        console.log();
+        if (kind === "bash" || kind === "zsh") {
+            await installPosixWrapper(kind, ctx, prompt);
+        }
+        else {
+            await installPathWrapper(kind, ctx, prompt);
+        }
+    }
+    catch (e) {
+        console.error(`\nAborted: ${(e as Error).message} Nothing was installed.`);
+        process.exit(1);
+    }
+    finally {
+        prompt.close();
+    }
 };
 
 const printUsage = (): void => {
@@ -795,6 +1180,7 @@ const printUsage = (): void => {
    git-wt-pool free   <number|path> [-y] [-f]   Release a worktree back to the pool
    git-wt-pool remove <number|path> [-y] [-f]   Permanently delete a pool worktree
    git-wt-pool path   [root|<number>]           Copy path of repo or slot to clipboard
+   git-wt-pool init   [<shell>] [--print]       Install the "gwt" wrapper for your shell (--print: manual steps)
 
  Flags:
    -n, --no-setup   (assign) Skip post-assign setup hooks
@@ -802,6 +1188,11 @@ const printUsage = (): void => {
                     (free, remove) Skip the confirmation prompt
    -f, --force      (free)   Stash the uncommitted work, then free the slot
                     (remove) Remove a worktree that holds uncommitted changes
+   --cwd-file <f>   (assign, path) Also write the resulting path to file <f> (used by gwt)
+
+ At a prompt, run these commands through "gwt" (installed by "git-wt-pool init"): it cd's
+ into the result of assign and path, which no child process can do. Scripts and CI can call
+ git-wt-pool directly.
 
  A dirty slot is never handed out. assign skips a free slot that still holds tracked
  changes, and it asks before "git clean -fd" deletes untracked files. free keeps the
@@ -828,7 +1219,10 @@ const main = async (): Promise<void> => {
             yes: { type: "boolean", short: "y" },
             force: { type: "boolean", short: "f" },
             help: { type: "boolean", short: "h" },
-            "no-setup": { type: "boolean", short: "n" }
+            "no-setup": { type: "boolean", short: "n" },
+            "cwd-file": { type: "string" },
+            all: { type: "boolean" },
+            print: { type: "boolean" }
         },
         strict: false
     });
@@ -838,10 +1232,36 @@ const main = async (): Promise<void> => {
     const force = (values.force as boolean | undefined) ?? false;
     const help = (values.help as boolean | undefined) ?? false;
     const noSetup = (values["no-setup"] as boolean | undefined) ?? false;
+    const cwdFile = values["cwd-file"] as string | undefined;
+    const all = (values.all as boolean | undefined) ?? false;
+    const print = (values.print as boolean | undefined) ?? false;
 
-    if (!command || help) {
+    if (help) {
         printUsage();
-        process.exit(!command ? 1 : 0);
+        process.exit(0);
+    }
+
+    // Also gates a bare "git-wt-pool": a first-time user at a prompt gets the setup, not the usage text.
+    if (needsWrapperSetup(command, process.env, process.stdin.isTTY === true)) {
+        printWrapperRequired();
+        process.exit(1);
+    }
+
+    if (!command) {
+        printUsage();
+        process.exit(1);
+    }
+
+    if (command.toLowerCase() === "init") {
+        await cmdInit(arg, { print, all }, {
+            shellDir: SHELL_DIR,
+            platform: process.platform,
+            env: process.env,
+            homeDir: os.homedir(),
+            interactive: process.stdin.isTTY === true,
+            detected: detectCurrentShell()
+        });
+        return;
     }
 
     const { repoRoot, repoName, poolDir } = resolvePool();
@@ -852,7 +1272,7 @@ const main = async (): Promise<void> => {
             cmdList(repoRoot, poolDir, repoName);
             break;
         case "assign":
-            await cmdAssign(repoRoot, poolDir, repoName, arg, noSetup, yes);
+            await cmdAssign(repoRoot, poolDir, repoName, arg, noSetup, yes, cwdFile);
             break;
         case "free":
             await cmdFree(repoRoot, poolDir, repoName, arg, yes, force);
@@ -861,7 +1281,7 @@ const main = async (): Promise<void> => {
             await cmdRemove(repoRoot, poolDir, repoName, arg, yes, force);
             break;
         case "path":
-            cmdPath(repoRoot, poolDir, repoName, arg);
+            cmdPath(repoRoot, poolDir, repoName, arg, cwdFile);
             break;
         default:
             console.error(`ERROR: Unknown command "${command}"`);
