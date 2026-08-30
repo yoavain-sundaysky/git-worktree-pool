@@ -7,13 +7,16 @@ jest.mock("node:child_process", () => ({ execSync: jest.fn() }));
 jest.mock("node:fs");
 jest.mock("clipboardy", () => ({ writeSync: jest.fn() }));
 jest.mock("node:readline/promises", () => ({
-    createInterface: () => ({ question: mockQuestion, close: () => {} })
+    createInterface: () => ({ question: mockQuestion, on: () => {}, once: () => {}, off: () => {}, close: () => {} })
 }));
 
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
-import type { FreeNote, SlotInfo } from "../../../src/bin/git-wt-pool";
-import { cmdAssign, cmdFree, cmdRemove, isClean, parseSlotStatus, printList, readFreeNote } from "../../../src/bin/git-wt-pool";
+import type { FreeNote, InitContext, ShellKind, SlotInfo } from "../../../src/bin/git-wt-pool";
+import {
+    POSIX_WRAPPER_HOME_PATH, WRAPPER_ENV, cmdAssign, cmdFree, cmdInit, cmdPath, cmdRemove, detectShell, isClean, needsWrapperSetup, parseShellKind, parseSlotStatus, printList,
+    readFreeNote, renderShellSetup
+} from "../../../src/bin/git-wt-pool";
 
 const ROOT_SLOT: SlotInfo = { path: "repo", status: "root", branch: "master", diff: "-" };
 
@@ -65,6 +68,15 @@ const installFsFake = (): void => {
     mockedFs.mkdirSync.mockImplementation(p => {
         dirs.add(String(p));
         return undefined as never;
+    });
+    mockedFs.copyFileSync.mockImplementation((src, dest) => {
+        if (!files.has(String(src))) {
+            throw new Error(`ENOENT: ${String(src)}`);
+        }
+        files.set(String(dest), files.get(String(src)) as string);
+    });
+    mockedFs.appendFileSync.mockImplementation((p, data) => {
+        files.set(String(p), `${files.get(String(p)) ?? ""}${String(data)}`);
     });
 };
 
@@ -138,7 +150,145 @@ const setTty = (isTty: boolean): void => {
 
 const gitCommands = (needle: string): string[] => gitLog.filter(command => command.includes(needle));
 
+const CWD_FILE = path.join("C:", "tmp", "gwt.cwd");
+
 describe("git-wt-pool", () => {
+    describe("bundled shell wrappers", () => {
+        const realFs = jest.requireActual<typeof fs>("node:fs");
+        const shellDir = path.join(__dirname, "..", "..", "..", "shell");
+        const readWrapper = (file: string): string => realFs.readFileSync(path.join(shellDir, file), "utf8");
+
+        it.each(["gwt.sh", "gwt.ps1", "gwt.cmd"])("ships %s, which calls git-wt-pool with --cwd-file and marks itself as the wrapper", file => {
+            const wrapper = readWrapper(file);
+            expect(wrapper).toContain("git-wt-pool");
+            expect(wrapper).toContain("--cwd-file");
+            expect(wrapper).toContain(WRAPPER_ENV);
+        });
+
+        // bash rejects CRLF ("$'\r': command not found"); cmd.exe wants CRLF. .gitattributes pins both.
+        it("keeps gwt.sh and gwt.ps1 on LF and gwt.cmd on CRLF", () => {
+            expect(readWrapper("gwt.sh")).not.toContain("\r");
+            expect(readWrapper("gwt.ps1")).not.toContain("\r");
+            const cmd = readWrapper("gwt.cmd");
+            expect(cmd).toContain("\r\n");
+            expect(cmd.replace(/\r\n/g, "")).not.toContain("\n");
+        });
+    });
+
+    describe("wrapper gate", () => {
+        it("lets a wrapped call through at a prompt", () => {
+            expect(needsWrapperSetup("assign", { [WRAPPER_ENV]: "1" }, true)).toBe(false);
+        });
+
+        it("requires the wrapper for a direct call at a prompt", () => {
+            expect(needsWrapperSetup("assign", {}, true)).toBe(true);
+            expect(needsWrapperSetup("list", {}, true)).toBe(true);
+        });
+
+        // A first-time user types just "git-wt-pool"; the setup must appear there too, not the usage text.
+        it("gates a bare invocation without a command", () => {
+            expect(needsWrapperSetup(undefined, {}, true)).toBe(true);
+            expect(needsWrapperSetup(undefined, { [WRAPPER_ENV]: "1" }, true)).toBe(false);
+            expect(needsWrapperSetup(undefined, {}, false)).toBe(false);
+        });
+
+        // Scripts, CI and hooks have no prompt to cd, so they keep calling the CLI directly.
+        it("lets a non-interactive caller through without the wrapper", () => {
+            expect(needsWrapperSetup("assign", {}, false)).toBe(false);
+        });
+
+        it("never gates the installer itself", () => {
+            expect(needsWrapperSetup("init", {}, true)).toBe(false);
+            expect(needsWrapperSetup("INIT", {}, true)).toBe(false);
+        });
+
+        it("prints the install line of every bundled wrapper with its absolute path under --all on Windows", () => {
+            const shellDir = path.join("C:", "pkg", "shell");
+            const setup = renderShellSetup(shellDir, { platform: "win32" });
+            for (const file of ["gwt.sh", "gwt.ps1", "gwt.cmd"]) {
+                expect(setup).toContain(path.join(shellDir, file));
+            }
+            expect(setup).toContain("source ");
+            expect(setup).toContain("PATH");
+        });
+
+        it("leaves cmd.exe out of --all on other platforms", () => {
+            const shellDir = path.join("C:", "pkg", "shell");
+            const setup = renderShellSetup(shellDir, { platform: "linux" });
+            expect(setup).toContain(path.join(shellDir, "gwt.sh"));
+            expect(setup).toContain(path.join(shellDir, "gwt.ps1"));
+            expect(setup).not.toContain("gwt.cmd");
+        });
+
+        it("slims the output to the detected shell and points at the others", () => {
+            const shellDir = path.join("C:", "pkg", "shell");
+            const setup = renderShellSetup(shellDir, { detected: "powershell" });
+            expect(setup).toContain("Your shell looks like PowerShell");
+            expect(setup).toContain(path.join(shellDir, "gwt.ps1"));
+            expect(setup).not.toContain("gwt.sh");
+            expect(setup).not.toContain("gwt.cmd");
+            expect(setup).toContain("git-wt-pool init --print --all");
+        });
+
+        it("names the right profile file for bash and zsh", () => {
+            const shellDir = path.join("C:", "pkg", "shell");
+            expect(renderShellSetup(shellDir, { detected: "bash" })).toContain("~/.bashrc:");
+            expect(renderShellSetup(shellDir, { detected: "zsh" })).toContain("~/.zshrc:");
+        });
+    });
+
+    describe("shell detection", () => {
+        const win = (env: NodeJS.ProcessEnv, parentProcess?: string): ShellKind => detectShell({ platform: "win32", env, parentProcess });
+        const linux = (env: NodeJS.ProcessEnv, parentProcess?: string): ShellKind => detectShell({ platform: "linux", env, parentProcess });
+        const userProfile = "C:\\Users\\me";
+        const psModulesFromPowerShell = `${userProfile}\\Documents\\PowerShell\\Modules;C:\\Program Files\\PowerShell\\Modules`;
+        const psModulesFromCmd = "C:\\Program Files\\WindowsPowerShell\\Modules;C:\\Windows\\system32\\WindowsPowerShell\\v1.0\\Modules";
+
+        it.each([
+            ["pwsh.exe", "powershell"],
+            ["powershell.exe", "powershell"],
+            ["cmd.exe", "cmd"],
+            ["bash.exe", "bash"],
+            ["sh.exe", "bash"],
+            ["/bin/zsh", "zsh"],
+            ["-zsh", "zsh"]
+        ])("recognizes the parent process %s", (parent, expected) => {
+            expect(detectShell({ platform: "win32", env: {}, parentProcess: parent })).toBe(expected);
+        });
+
+        // Environment markers are inherited, so the parent process must win over them.
+        it("trusts the parent process over inherited environment markers", () => {
+            expect(win({ MSYSTEM: "MINGW64", SHELL: "/bin/bash.exe" }, "pwsh.exe")).toBe("powershell");
+            expect(win({ USERPROFILE: userProfile, PSModulePath: psModulesFromPowerShell }, "cmd.exe")).toBe("cmd");
+        });
+
+        it("falls back to Git Bash markers on Windows when the parent is unknown", () => {
+            expect(win({ MSYSTEM: "MINGW64", SHELL: "/bin/bash.exe" }, "node.exe")).toBe("bash");
+            expect(win({ SHELL: "/usr/bin/zsh" })).toBe("zsh");
+        });
+
+        it("tells PowerShell from cmd.exe by the user module path PowerShell prepends", () => {
+            expect(win({ USERPROFILE: userProfile, PSModulePath: psModulesFromPowerShell })).toBe("powershell");
+            expect(win({ USERPROFILE: userProfile, PSModulePath: psModulesFromCmd })).toBe("cmd");
+            expect(win({})).toBe("cmd");
+        });
+
+        it("uses the login shell and pwsh's PSModulePath on other platforms", () => {
+            expect(linux({ SHELL: "/usr/bin/zsh" })).toBe("zsh");
+            expect(linux({ SHELL: "/bin/bash" })).toBe("bash");
+            expect(linux({ SHELL: "/bin/bash", PSModulePath: "/home/me/.local/share/powershell/Modules" })).toBe("powershell");
+            expect(linux({})).toBe("bash");
+        });
+
+        it("accepts explicit shell names and their common aliases", () => {
+            expect(parseShellKind("PowerShell")).toBe("powershell");
+            expect(parseShellKind("pwsh")).toBe("powershell");
+            expect(parseShellKind("sh")).toBe("bash");
+            expect(parseShellKind("CMD")).toBe("cmd");
+            expect(parseShellKind("fish")).toBeUndefined();
+        });
+    });
+
     describe("printList", () => {
         beforeEach(() => {
             jest.spyOn(console, "table").mockImplementation(() => {});
@@ -318,6 +468,160 @@ describe("git-wt-pool", () => {
                 expect(printed).toContain("ARCH-000-test-jest-client");
                 expect(printed).toContain("2a1200a5d4e5630c390e70636480d0c697e0b3a1");
                 expect(printed).toContain("stash apply");
+            });
+
+            it("writes the assigned slot to --cwd-file so the gwt wrapper can cd into it", async () => {
+                givenFreePool(1);
+
+                await cmdAssign(REPO_ROOT, POOL_DIR, REPO_NAME, "PCS-4821", true, true, CWD_FILE);
+
+                expect(files.get(CWD_FILE)).toBe(`${slotDir(1)}\n`);
+            });
+
+            it("writes no cwd file when the assign is aborted", async () => {
+                givenFreePool(1);
+                porcelain[slotDir(1)] = "?? scratch.txt\n";
+                setTty(true);
+                mockQuestion.mockResolvedValue("n");
+
+                await cmdAssign(REPO_ROOT, POOL_DIR, REPO_NAME, "PCS-4821", true, false, CWD_FILE);
+
+                expect(files.has(CWD_FILE)).toBe(false);
+            });
+        });
+
+        describe("cmdPath", () => {
+            it("prints the slot path and writes it to --cwd-file", () => {
+                givenAssignedSlot(1);
+
+                cmdPath(REPO_ROOT, POOL_DIR, REPO_NAME, "1", CWD_FILE);
+
+                expect(console.log).toHaveBeenCalledWith(slotDir(1));
+                expect(files.get(CWD_FILE)).toBe(`${slotDir(1)}\n`);
+            });
+
+            it("resolves root to the main repo", () => {
+                givenAssignedSlot(1);
+
+                cmdPath(REPO_ROOT, POOL_DIR, REPO_NAME, "root", CWD_FILE);
+
+                expect(files.get(CWD_FILE)).toBe(`${REPO_ROOT}\n`);
+            });
+
+            it("refuses a missing slot and writes no cwd file", () => {
+                givenAssignedSlot(1);
+
+                expect(() => cmdPath(REPO_ROOT, POOL_DIR, REPO_NAME, "7", CWD_FILE)).toThrow("process.exit(1)");
+
+                expect(files.has(CWD_FILE)).toBe(false);
+            });
+        });
+
+        describe("cmdInit", () => {
+            const HOME = path.join("C:", "Users", "me");
+            const NPM_DIR = path.join(HOME, "AppData", "Roaming", "npm");
+            const SHELL_DIR = path.join(NPM_DIR, "node_modules", "git-worktree-pool", "shell");
+            const BIN_DIR = path.join(HOME, "bin");
+            const SYSTEM_DIR = path.join("C:", "Windows", "system32");
+            const interactive = { print: false, all: false };
+            const context = (overrides: Partial<InitContext> = {}): InitContext => ({
+                shellDir: SHELL_DIR,
+                platform: "win32",
+                env: { PATH: [SYSTEM_DIR, NPM_DIR, BIN_DIR].join(path.delimiter) },
+                homeDir: HOME,
+                interactive: true,
+                detected: "powershell",
+                ...overrides
+            });
+            const installedCopies = (file: string): string[] => [...files.keys()].filter(key => key.endsWith(file) && !key.startsWith(SHELL_DIR));
+
+            beforeEach(() => {
+                dirs.add(NPM_DIR);
+                dirs.add(BIN_DIR);
+                for (const file of ["gwt.sh", "gwt.ps1", "gwt.cmd"]) {
+                    files.set(path.join(SHELL_DIR, file), `<${file}>`);
+                }
+            });
+
+            it("copies gwt.ps1 into npm's global bin directory when it is on PATH and the user accepts the defaults", async () => {
+                mockQuestion.mockResolvedValue("");
+
+                await cmdInit(undefined, interactive, context());
+
+                expect(files.get(path.join(NPM_DIR, "gwt.ps1"))).toBe("<gwt.ps1>");
+                expect(installedCopies("gwt.ps1")).toEqual([path.join(NPM_DIR, "gwt.ps1")]);
+            });
+
+            // PATH is not listed (it commonly holds dozens of entries); the user pastes the directory.
+            it("asks for a directory when npm's directory is not on PATH, and copies to the pasted one", async () => {
+                mockQuestion.mockResolvedValueOnce("cmd").mockResolvedValueOnce(BIN_DIR);
+
+                await cmdInit(undefined, interactive, context({ env: { PATH: [SYSTEM_DIR, BIN_DIR].join(path.delimiter) } }));
+
+                expect(files.get(path.join(BIN_DIR, "gwt.cmd"))).toBe("<gwt.cmd>");
+                expect(installedCopies("gwt.cmd")).toEqual([path.join(BIN_DIR, "gwt.cmd")]);
+                const printed = (console.log as jest.Mock).mock.calls.map(call => String(call[0])).join("\n");
+                expect(printed).not.toContain(SYSTEM_DIR);
+            });
+
+            it("expands ~ in a pasted directory", async () => {
+                mockQuestion.mockResolvedValueOnce("n").mockResolvedValueOnce("~/bin");
+
+                await cmdInit("powershell", interactive, context());
+
+                expect(installedCopies("gwt.ps1")).toEqual([path.join(BIN_DIR, "gwt.ps1")]);
+            });
+
+            it("warns before copying to a directory that is not on PATH, and aborts when declined", async () => {
+                mockQuestion.mockResolvedValueOnce("n").mockResolvedValueOnce(path.join("C:", "elsewhere")).mockResolvedValueOnce("n");
+
+                await cmdInit("powershell", interactive, context());
+
+                expect(installedCopies("gwt.ps1")).toEqual([]);
+                const reported = (console.error as jest.Mock).mock.calls.map(call => String(call[0])).join("\n");
+                expect(reported).toContain("not on your PATH");
+            });
+
+            it("installs gwt.sh under $HOME and appends one source line to the profile, even when run twice", async () => {
+                mockQuestion.mockResolvedValue("");
+                files.set(path.join(HOME, ".bashrc"), "export FOO=1");
+                const ctx = context({ platform: "linux", detected: "bash", env: { PATH: "/usr/bin" } });
+
+                await cmdInit(undefined, interactive, ctx);
+                await cmdInit(undefined, interactive, ctx);
+
+                expect(files.get(path.join(HOME, ".config", "git-wt-pool", "gwt.sh"))).toBe("<gwt.sh>");
+                const profile = files.get(path.join(HOME, ".bashrc")) ?? "";
+                expect(profile.startsWith("export FOO=1\n")).toBe(true);
+                expect(profile).toContain(`source "$HOME/${POSIX_WRAPPER_HOME_PATH}"`);
+                expect(profile.split("\n").filter(line => line.includes(POSIX_WRAPPER_HOME_PATH)).length).toBe(1);
+            });
+
+            it("defaults to ~/.zshrc for zsh", async () => {
+                mockQuestion.mockResolvedValue("");
+
+                await cmdInit("zsh", interactive, context({ platform: "darwin", env: { PATH: "/usr/bin" } }));
+
+                expect(files.get(path.join(HOME, ".zshrc"))).toContain(POSIX_WRAPPER_HOME_PATH);
+                expect(files.has(path.join(HOME, ".bashrc"))).toBe(false);
+            });
+
+            it("prints the manual steps and writes nothing without a terminal or with --print", async () => {
+                await cmdInit(undefined, interactive, context({ interactive: false }));
+                await cmdInit(undefined, { print: true, all: false }, context());
+
+                expect(mockedFs.copyFileSync).not.toHaveBeenCalled();
+                expect(mockedFs.appendFileSync).not.toHaveBeenCalled();
+                expect(mockQuestion).not.toHaveBeenCalled();
+                const printed = (console.log as jest.Mock).mock.calls.map(call => String(call[0])).join("\n");
+                expect(printed).toContain("Your shell looks like PowerShell");
+            });
+
+            it("rejects an unknown shell name before asking anything", async () => {
+                await expect(cmdInit("fish", interactive, context())).rejects.toThrow("process.exit(1)");
+
+                expect(mockQuestion).not.toHaveBeenCalled();
+                expect(mockedFs.copyFileSync).not.toHaveBeenCalled();
             });
         });
 

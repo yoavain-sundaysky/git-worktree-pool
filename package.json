@@ -8,7 +8,8 @@
     "git-wt-pool": "./dist/bin/git-wt-pool.js"
   },
   "files": [
-    "dist"
+    "dist",
+    "shell"
   ],
   "scripts": {
     "prepare": "npm run husky-install && npm run build",
